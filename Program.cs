@@ -1,74 +1,162 @@
 ﻿// See https://aka.ms/new-console-template for more information
 
-using System.Collections.Immutable;
-using favfix;
 using Spectre.Console;
-using System.Text.Json.Serialization;
+using Spectre.Console.Cli;
+using System.Collections.Immutable;
+using System.ComponentModel;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
-var settingsFile = Path.Join(Environment.CurrentDirectory, "settings.json");
+namespace favfix;
 
-var settings = LmSettings.LoadFile(settingsFile);
-
-if (string.IsNullOrWhiteSpace(settings.Host))
+internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
 {
-    settings.Host = AnsiConsole.Prompt(new TextPrompt<string>("Host>").DefaultValue("localhost"));
-    settings.Port = AnsiConsole.Prompt(new TextPrompt<int>("Port?").DefaultValue(1234));
-    settings.Save(settingsFile);
-}
-
-var lm = new LmStudio(settings.Host, settings.Port);
-
-if (string.IsNullOrWhiteSpace(settings.SelectedModel))
-{
-    var models = await Cli.Status("Fetching available models...", async () => await lm.GetModels());
-    settings.SelectedModel = Cli.SelectString("Select model", "models", models);
-    settings.Save(settingsFile);
-}
-
-Console.WriteLine($"Using: {settings.SelectedModel}");
-
-string html = "<html><body>This page will discuss the importance of petting dogs in video games and how it might improve your life. <a href=\"\">Click here</a> to start your dog petting journey.</body></html>";
-var json = JsonSerializer.Serialize(new TagsResponse()
+    public class Settings : CommandSettings
     {
-        Tags = ["list", "of", "tags"],
-        Reasoning = "the tags were selected as a example"
+        [CommandArgument(0, "<file>")]
+        [Description("The file to to review")]
+        public string FileName { get; init; } = string.Empty;
     }
-);
-var question = $"Given the following html code, extract the tags that would be entered on the social bookmarking site del.icio.us. " +
-               $"Feel free to improve the tags. Output a syntactically similar to the following json. " +
-               $"Include the reasoning with at least 2 sentences for choosing he specific tags in the reason property. " +
-               $"Don't output example code and don't format it as markdown. " +
-               $"Only the actual json:\n\n{json}\n\n" +
-               $"Html starts now:\n\n{html}";
 
-var res = await Cli.Status("Thinking...", async () => await lm.GetCompletions(settings.SelectedModel, question));
-foreach (var m in res.Choices)
-{
-    var r = JsonSerializer.Deserialize<TagsResponse>(m.Message.Content);
-    try
+    private (string, string) ReadMarkdown(string file)
     {
-        if (r != null)
+        var content = File.ReadAllText(file);
+        return SplitFrontMatter(content, "+++");
+    }
+
+    private static (string, string) SplitFrontMatter(string content, string split)
+    {
+        var first = content.IndexOf(split, StringComparison.Ordinal);
+        if (first == -1) return ("", "");
+
+        var second = content.IndexOf(split, first + split.Length, StringComparison.Ordinal);
+        if (second == -1) return ("", "");
+
+        var header = content.Substring(first + split.Length, second);
+        var body = content.Substring(second + split.Length);
+        return (header, body);
+    }
+
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellation)
+    {
+        var llm = await Tags.ConnectToModel();
+
+        var (_, md) = ReadMarkdown(settings.FileName);
+        var responses = await Tags.AiTags(md, "markdown", llm);
+
+        var tags = responses.SelectMany(x => x.Tags).ToImmutableHashSet();
+
+        foreach (var r in tags)
+        {
+            Console.WriteLine(r);
+        }
+
+        return 0;
+    }
+}
+
+internal class FavoriteCommand : AsyncCommand<FavoriteCommand.Settings>
+{
+    public class Settings : CommandSettings
+    {
+    }
+
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellation)
+    {
+        var llm = await Tags.ConnectToModel();
+
+        string html = "<html><body>This page will discuss the importance of petting dogs in video games and how it might improve your life. <a href=\"\">Click here</a> to start your dog petting journey.</body></html>";
+        var responses = await Tags.AiTags(html, "html", llm);
+        foreach (var r in responses)
         {
             var tags = string.Join(",", r.Tags.Select(x => JsonSerializer.Serialize(x)));
             Console.WriteLine($"{r.Reasoning}");
             Console.WriteLine($"{tags}");
             Console.WriteLine();
-            continue;
         }
-        else
-        {
-            Console.WriteLine($"Parsed a null");
-        }
+        return 0;
     }
-    catch (Exception)
-    {
-        Console.WriteLine($"Not a json...");
-    }
-    Console.WriteLine($"> {m.Message.Content}");
-
 }
 
+internal class Program
+{
+    public static async Task<int> Main(string[] args)
+    {
+        var app = new CommandApp();
+        app.Configure(config =>
+        {
+            config.AddCommand<MarkdownCommand>("md");
+            config.AddCommand<FavoriteCommand>("fav");
+        });
+        return await app.RunAsync(args);
+    }
+}
+
+internal static class Tags
+{
+    public static async Task<List<TagsResponse>> AiTags(string input, string type, Func<string, Task<CompletionResponse>> llm)
+    {
+        var json = JsonSerializer.Serialize(new TagsResponse()
+        {
+            Tags = ["list", "of", "tags"],
+            Reasoning = "the tags were selected as a example"
+        }
+        );
+        var question = $"Given the following {type} code, extract the tags that would be entered on the social bookmarking site del.icio.us. " +
+                       $"Feel free to improve the tags. Output a syntactically similar to the following json. " +
+                       $"Include the reasoning with at least 2 sentences for choosing he specific tags in the reason property. " +
+                       $"Don't output example code and don't format it as markdown. " +
+                       $"Only the actual json:\n\n{json}\n\n" +
+                       $"{type} code starts now:\n\n{input}";
+
+        var res = await Cli.Status("Thinking...", async () => await llm(question));
+        var responses = new List<TagsResponse>();
+        foreach (var m in res.Choices)
+        {
+            var r = JsonSerializer.Deserialize<TagsResponse>(m.Message.Content);
+            try
+            {
+                if (r == null)
+                {
+                    throw new Exception("Parsed a null");
+                }
+                responses.Add(r);
+            }
+            catch (Exception x)
+            {
+                throw new Exception("Not a json...", x);
+            }
+        }
+
+        return responses;
+    }
+
+    public static async Task<Func<string, Task<CompletionResponse>>> ConnectToModel()
+    {
+        var settingsFile = Path.Join(Environment.CurrentDirectory, "settings.json");
+
+        var settings = LmSettings.LoadFile(settingsFile);
+
+        if (string.IsNullOrWhiteSpace(settings.Host))
+        {
+            settings.Host = AnsiConsole.Prompt(new TextPrompt<string>("Host>").DefaultValue("localhost"));
+            settings.Port = AnsiConsole.Prompt(new TextPrompt<int>("Port?").DefaultValue(1234));
+            settings.Save(settingsFile);
+        }
+
+        var lm = new LmStudio(settings.Host, settings.Port);
+
+        if (string.IsNullOrWhiteSpace(settings.SelectedModel))
+        {
+            var models = await Cli.Status("Fetching available models...", async () => await lm.GetModels());
+            settings.SelectedModel = Cli.SelectString("Select model", "models", models);
+            settings.Save(settingsFile);
+        }
+
+        Console.WriteLine($"Using: {settings.SelectedModel}");
+        return async (question) => await lm.GetCompletions(settings.SelectedModel, question);
+    }
+}
 
 internal class TagsResponse
 {
