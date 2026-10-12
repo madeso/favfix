@@ -109,7 +109,13 @@ internal static class Tags
                        $"Only the actual json:\n\n{json}\n\n" +
                        $"{type} code starts now:\n\n{input}";
 
+        var start = DateTime.Now;
         var res = await Cli.Status("Thinking...", async () => await llm(question));
+        var end = DateTime.Now;
+        {
+            var diff = end.Subtract(start);
+            AnsiConsole.MarkupLineInterpolated($"Took {Math.Floor(diff.TotalSeconds)}s {diff.Milliseconds}ms");
+        }
         var responses = new List<TagsResponse>();
         foreach (var m in res.Choices)
         {
