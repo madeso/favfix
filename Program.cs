@@ -18,19 +18,19 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         public string FileName { get; init; } = string.Empty;
     }
 
-    private (string, string) ReadMarkdown(string file)
+    private (string?, string) ReadMarkdown(string file)
     {
         var content = File.ReadAllText(file);
         return SplitFrontMatter(content, "+++");
     }
 
-    private static (string, string) SplitFrontMatter(string content, string split)
+    private static (string?, string) SplitFrontMatter(string content, string split)
     {
         var first = content.IndexOf(split, StringComparison.Ordinal);
-        if (first == -1) return ("", "");
+        if (first == -1) return (null, content);
 
         var second = content.IndexOf(split, first + split.Length, StringComparison.Ordinal);
-        if (second == -1) return ("", "");
+        if (second == -1) return (null, content);
 
         var header = content.Substring(first + split.Length, second);
         var body = content.Substring(second + split.Length);
@@ -41,8 +41,13 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
     {
         var llm = await Tags.ConnectToModel();
 
-        var (_, md) = ReadMarkdown(settings.FileName);
-        var responses = await Tags.AiTags(md, "markdown", llm);
+        var (fm, md) = ReadMarkdown(settings.FileName);
+        if (fm == null)
+        {
+            AnsiConsole.WriteLine("Failed to read markdown");
+            return -1;
+        }
+        var responses = await Tags.AiTags(md, "markdown", llm, "Format tags with spaces, normal capitalization and diacritics as you would in a normal sentence.");
 
         var tags = responses.SelectMany(x => x.Tags).ToImmutableHashSet();
 
@@ -94,7 +99,7 @@ internal class Program
 
 internal static class Tags
 {
-    public static async Task<List<TagsResponse>> AiTags(string input, string type, Func<string, Task<CompletionResponse>> llm)
+    public static async Task<List<TagsResponse>> AiTags(string input, string type, Func<string, Task<CompletionResponse>> llm, string extra = "")
     {
         var json = JsonSerializer.Serialize(new TagsResponse()
         {
@@ -103,9 +108,9 @@ internal static class Tags
         }
         );
         var question = $"Given the following {type} code, extract the tags that would be entered on the social bookmarking site del.icio.us. " +
-                       $"Feel free to improve the tags. Output a syntactically similar to the following json. " +
-                       $"Include the reasoning with at least 2 sentences for choosing he specific tags in the reason property. " +
-                       $"Don't output example code and don't format it as markdown. " +
+                       $"Feel free to improve the tags. Output a syntactically similar to the attached json. " +
+                       $"Include the reasoning with at least 2 sentences for choosing the specific tags in the reason property. " +
+                       $"Don't output example code and don't format it as markdown. {extra} " +
                        $"Only the actual json:\n\n{json}\n\n" +
                        $"{type} code starts now:\n\n{input}";
 
@@ -114,7 +119,7 @@ internal static class Tags
         var end = DateTime.Now;
         {
             var diff = end.Subtract(start);
-            AnsiConsole.MarkupLineInterpolated($"Took {Math.Floor(diff.TotalSeconds)}s {diff.Milliseconds}ms");
+            AnsiConsole.MarkupLineInterpolated($"Took {Math.Floor(diff.TotalSeconds)}s {diff.Milliseconds}ms ({diff})");
         }
         var responses = new List<TagsResponse>();
         foreach (var m in res.Choices)
