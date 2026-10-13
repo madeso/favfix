@@ -4,9 +4,10 @@ using Spectre.Console;
 using Spectre.Console.Cli;
 using System.Collections.Immutable;
 using System.ComponentModel;
+using System.Reflection.Metadata;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Xml.Serialization;
+using Microsoft.Extensions.FileSystemGlobbing;
 using Tomlyn;
 using Tomlyn.Serialization;
 
@@ -24,30 +25,92 @@ public class FrontMatter
     public IDictionary<string, object?>? Extra { get; set; }
 }
 
+internal static class Glob
+{
+    public static IEnumerable<string> Files(IEnumerable<string> args)
+    {
+        var m = new Matcher();
+
+        // does this recursive add all files?
+
+        m.AddIncludePatterns(args);
+        var r = m.GetResultsInFullPath(Environment.CurrentDirectory);
+
+        // get absolute paths
+        return r.Select(f => (new FileInfo(f)).FullName);
+    }
+}
+
+
+public static class SpectreExtensions
+{
+    public static async Task RunArrayAsync<T>(this Progress progress, ImmutableArray<T> arr, Func<T, string?> title, Func<T, Task<bool>> action)
+    {
+        if (arr.Length == 1)
+        {
+            await action(arr[0]);
+        }
+        else if (arr.Length > 1)
+        {
+            var cont = await action(arr[0]);
+            if (cont == false) return;
+            await progress.StartAsync(async ctx =>
+            {
+                var index = 1;
+                var task = ctx.AddTask(ToTaskMessage(title(arr[index])), maxValue: arr.Length - 1);
+
+                while (!ctx.IsFinished)
+                {
+                    task.Description = ToTaskMessage(title(arr[index]));
+                    cont = await action(arr[index]);
+                    if (cont == false) return;
+                    task.Description = ToTaskMessage(title(arr[index]));
+
+                    // Increment
+                    task.Increment(1);
+                    index += 1;
+                }
+            });
+        }
+
+        return;
+
+        static string ToTaskMessage(string? message)
+            => string.IsNullOrWhiteSpace(message) ? "Waiting..." : message;
+    }
+
+}
+
+
+
 internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
 {
     public class Settings : CommandSettings
     {
         [CommandArgument(0, "<file>")]
-        [Description("The file to to review")]
-        public string FileName { get; init; } = string.Empty;
+        [Description("The files to to review")]
+        public string[] FileNames { get; init; } = [];
 
         [CommandOption("-f|--force")]
         [Description("Overwrite existing tags without aborting")]
         public bool Force { get; init; }
+
+        [CommandOption("-c|--continue")]
+        [Description("Continue on error")]
+        public bool Continue { get; init; }
     }
 
-    private const string TOML_LINE = "+++";
+    private const string TomlLine = "+++";
 
     private static (string?, string) ReadMarkdown(string file)
     {
         var content = File.ReadAllText(file);
-        return SplitFrontMatter(content, TOML_LINE);
+        return SplitFrontMatter(content, TomlLine);
     }
 
     private static void WriteMarkdown(string file, string fm, string md)
     {
-        var content = $"{TOML_LINE}\n{fm.Trim()}\n{TOML_LINE}\n{md.Trim()}\n";
+        var content = $"{TomlLine}\n{fm.Trim()}\n{TomlLine}\n{md.Trim()}\n";
         File.WriteAllText(file, content);
     }
 
@@ -64,22 +127,81 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         return (header, body);
     }
 
-    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellation)
+    internal static Progress Progress()
+    {
+        return AnsiConsole.Progress()
+            .AutoClear(true)
+            .HideCompleted(true)
+            .Columns(
+                new SpinnerColumn(),
+                new ProgressBarColumn(),
+                new PercentageColumn(),
+                new RemainingTimeColumn(),
+                new TaskDescriptionColumn()
+            );
+    }
+
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings,
+        CancellationToken cancellation)
     {
         var llm = await Tags.ConnectToModel();
 
-        var (fmSource, md) = ReadMarkdown(settings.FileName);
+        var allFiles = Glob.Files(settings.FileNames).ToImmutableArray();
+
+        if (allFiles.Length == 0)
+        {
+            AnsiConsole.WriteLine("No files detected");
+            return -1;
+        }
+
+        bool ok = true;
+
+        int tot = 0;
+        int suc = 0;
+        int err = 0;
+
+        await Progress().RunArrayAsync(allFiles, file=>$"Updating {file}...", async file =>
+        {
+            var ret = await UpdateTagsForFile(file, settings, llm, allFiles.Length == 1);
+
+            tot += 1;
+            if (ret) suc += 1;
+            else err += 1;
+
+            if (ret == false)
+            {
+                ok = false;
+
+                if (settings.Continue == false)
+                {
+                    AnsiConsole.WriteLine("Error detected, aborting...");
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        AnsiConsole.WriteLine($"Updated {suc} of {tot} file(s), failed {err}");
+
+        return ok ? 0 : -1;
+    }
+
+    private static async Task<bool> UpdateTagsForFile(string file, Settings settings,
+        Func<string, Task<CompletionResponse>> llm, bool showProgress)
+    {
+        var (fmSource, md) = ReadMarkdown(file);
         if (fmSource == null)
         {
-            AnsiConsole.WriteLine("Failed to read markdown");
-            return -1;
+            AnsiConsole.WriteLine($"{file}: Failed to read markdown");
+            return false;
         }
 
         var fm = TomlSerializer.Deserialize<FrontMatter>(fmSource);
         if (fm == null)
         {
-            AnsiConsole.WriteLine("Failed to read frontmatter");
-            return -1;
+            AnsiConsole.WriteLine($"{file}: Failed to read frontmatter");
+            return false;
         }
 
         fm.Tags = fm.Tags.Where(x => string.IsNullOrWhiteSpace(x) == false).Select(x => x.Trim()).ToList();
@@ -87,16 +209,13 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         {
             if (fm.Tags.Count != 0)
             {
-                AnsiConsole.WriteLine("Post contains existing tags, ignoring");
-                foreach (var t in fm.Tags)
-                {
-                    AnsiConsole.WriteLine($" - [{t}]");
-                }
-                return -1;
+                var strTags = string.Join(", ", fm.Tags.Select(x => $"[{x}]"));
+                AnsiConsole.WriteLine($"{file}: Post contains existing tags, ignoring: {strTags}");
+                return true;
             }
         }
 
-        var responses = await Tags.AiTags($"# {fm.Title}\n\n {md}", "markdown", llm,
+        var responses = await Tags.AiTags(showProgress, $"# {fm.Title}\n\n {md}", "markdown", llm,
             "Format tags with spaces, normal capitalization and diacritics as you would in a normal sentence. If it's a name, format it like wikipedia would, for example: 'New York (city)' and 'France (country)'. Don't use names inside parenthesis only nouns, for example not 'Stockholm (sweden)' but 'Stockholm (city)'.");
 
         var newTags = responses.SelectMany(x => x.Tags).Select(x => x.Trim()).ToImmutableHashSet();
@@ -104,7 +223,6 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
 
         foreach (var r in newTags)
         {
-            Console.WriteLine(r);
             if (oldTags.Contains(r.ToLowerInvariant()))
             {
                 continue;
@@ -112,9 +230,9 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
             fm.Tags.Add(r);
         }
 
-        WriteMarkdown(settings.FileName, TomlSerializer.Serialize(fm), md);
+        WriteMarkdown(file, TomlSerializer.Serialize(fm), md);
 
-        return 0;
+        return true;
     }
 }
 
@@ -129,7 +247,7 @@ internal class FavoriteCommand : AsyncCommand<FavoriteCommand.Settings>
         var llm = await Tags.ConnectToModel();
 
         string html = "<html><body>This page will discuss the importance of petting dogs in video games and how it might improve your life. <a href=\"\">Click here</a> to start your dog petting journey.</body></html>";
-        var responses = await Tags.AiTags(html, "html", llm);
+        var responses = await Tags.AiTags(true, html, "html", llm);
         foreach (var r in responses)
         {
             var tags = string.Join(",", r.Tags.Select(x => JsonSerializer.Serialize(x)));
@@ -157,7 +275,7 @@ internal class Program
 
 internal static class Tags
 {
-    public static async Task<List<TagsResponse>> AiTags(string input, string type, Func<string, Task<CompletionResponse>> llm, string extra = "")
+    public static async Task<List<TagsResponse>> AiTags(bool showProgress, string input, string type, Func<string, Task<CompletionResponse>> llm, string extra = "")
     {
         var json = JsonSerializer.Serialize(new TagsResponse()
         {
@@ -173,7 +291,7 @@ internal static class Tags
                        $"{type} code starts now:\n\n{input}";
 
         var start = DateTime.Now;
-        var res = await Cli.Status("Thinking...", async () => await llm(question));
+        var res = showProgress ? await Cli.Status("Thinking...", async () => await llm(question)) : await llm(question);
         var end = DateTime.Now;
         {
             var diff = end.Subtract(start);
