@@ -81,37 +81,20 @@ public static class SpectreExtensions
 
 }
 
-
-
-internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
+internal static class Ext
 {
-    public class Settings : CommandSettings
-    {
-        [CommandArgument(0, "<file>")]
-        [Description("The files to to review")]
-        public string[] FileNames { get; init; } = [];
-
-        [CommandOption("-f|--force")]
-        [Description("Overwrite existing tags without aborting")]
-        public bool Force { get; init; }
-
-        [CommandOption("-c|--continue")]
-        [Description("Continue on error")]
-        public bool Continue { get; init; }
-    }
-
     private const string TomlLine = "+++";
 
-    private static (string?, string) ReadMarkdown(string file)
+    internal static async Task<(string?, string)> ReadMarkdown(string file)
     {
-        var content = File.ReadAllText(file);
+        var content = await File.ReadAllTextAsync(file);
         return SplitFrontMatter(content, TomlLine);
     }
 
-    private static void WriteMarkdown(string file, string fm, string md)
+    internal static async Task WriteMarkdown(string file, string fm, string md)
     {
         var content = $"{TomlLine}\n{fm.Trim()}\n{TomlLine}\n{md.Trim()}\n";
-        File.WriteAllText(file, content);
+        await File.WriteAllTextAsync(file, content);
     }
 
     private static (string?, string) SplitFrontMatter(string content, string split)
@@ -140,6 +123,25 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
                 new TaskDescriptionColumn()
             );
     }
+}
+
+
+internal class CleanMarkdownCommand : AsyncCommand<CleanMarkdownCommand.Settings>
+{
+    public class Settings : CommandSettings
+    {
+        [CommandArgument(0, "<file>")]
+        [Description("The files to to review")]
+        public string[] FileNames { get; init; } = [];
+
+        [CommandOption("-f|--force")]
+        [Description("Overwrite existing tags without aborting")]
+        public bool Force { get; init; }
+
+        [CommandOption("-c|--continue")]
+        [Description("Continue on error")]
+        public bool Continue { get; init; }
+    }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings,
         CancellationToken cancellation)
@@ -160,7 +162,95 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         int suc = 0;
         int err = 0;
 
-        await Progress().RunArrayAsync(allFiles, file=>$"Updating {file}...", async file =>
+        await Ext.Progress().RunArrayAsync(allFiles, file => $"Updating {file}...", async file =>
+        {
+            var ret = await UpdateTagsForFile(file);
+
+            tot += 1;
+            if (ret) suc += 1;
+            else err += 1;
+
+            if (ret == false)
+            {
+                ok = false;
+
+                if (settings.Continue == false)
+                {
+                    AnsiConsole.WriteLine("Error detected, aborting...");
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        AnsiConsole.WriteLine($"Updated {suc} of {tot} file(s), failed {err}");
+
+        return ok ? 0 : -1;
+    }
+
+    private static async Task<bool> UpdateTagsForFile(string file)
+    {
+        var (fmSource, md) = await Ext.ReadMarkdown(file);
+        if (fmSource == null)
+        {
+            AnsiConsole.WriteLine($"{file}: Failed to read markdown");
+            return false;
+        }
+
+        var fm = TomlSerializer.Deserialize<FrontMatter>(fmSource);
+        if (fm == null)
+        {
+            AnsiConsole.WriteLine($"{file}: Failed to read frontmatter");
+            return false;
+        }
+
+        fm.Tags = [];
+
+        await Ext.WriteMarkdown(file, TomlSerializer.Serialize(fm), md);
+
+        return true;
+    }
+}
+
+
+internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
+{
+    public class Settings : CommandSettings
+    {
+        [CommandArgument(0, "<file>")]
+        [Description("The files to to review")]
+        public string[] FileNames { get; init; } = [];
+
+        [CommandOption("-f|--force")]
+        [Description("Overwrite existing tags without aborting")]
+        public bool Force { get; init; }
+
+        [CommandOption("-c|--continue")]
+        [Description("Continue on error")]
+        public bool Continue { get; init; }
+    }
+
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings,
+        CancellationToken cancellation)
+    {
+        var llm = await Tags.ConnectToModel();
+
+        var allFiles = Glob.Files(settings.FileNames).ToImmutableArray();
+
+        if (allFiles.Length == 0)
+        {
+            AnsiConsole.WriteLine("No files detected");
+            return -1;
+        }
+
+        bool ok = true;
+
+        int tot = 0;
+        int suc = 0;
+        int err = 0;
+
+        await Ext.Progress().RunArrayAsync(allFiles, file=>$"Updating {file}...", async file =>
         {
             var ret = await UpdateTagsForFile(file, settings, llm, allFiles.Length == 1);
 
@@ -190,7 +280,7 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
     private static async Task<bool> UpdateTagsForFile(string file, Settings settings,
         Func<string, Task<CompletionResponse>> llm, bool showProgress)
     {
-        var (fmSource, md) = ReadMarkdown(file);
+        var (fmSource, md) = await Ext.ReadMarkdown(file);
         if (fmSource == null)
         {
             AnsiConsole.WriteLine($"{file}: Failed to read markdown");
@@ -230,7 +320,7 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
             fm.Tags.Add(r);
         }
 
-        WriteMarkdown(file, TomlSerializer.Serialize(fm), md);
+        await Ext.WriteMarkdown(file, TomlSerializer.Serialize(fm), md);
 
         return true;
     }
@@ -266,6 +356,7 @@ internal class Program
         var app = new CommandApp();
         app.Configure(config =>
         {
+            config.AddCommand<CleanMarkdownCommand>("clean-md");
             config.AddCommand<MarkdownCommand>("md");
             config.AddCommand<FavoriteCommand>("fav");
         });
