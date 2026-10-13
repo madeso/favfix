@@ -31,12 +31,24 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         [CommandArgument(0, "<file>")]
         [Description("The file to to review")]
         public string FileName { get; init; } = string.Empty;
+
+        [CommandOption("-f|--force")]
+        [Description("Overwrite existing tags without aborting")]
+        public bool Force { get; init; }
     }
 
-    private (string?, string) ReadMarkdown(string file)
+    private const string TOML_LINE = "+++";
+
+    private static (string?, string) ReadMarkdown(string file)
     {
         var content = File.ReadAllText(file);
-        return SplitFrontMatter(content, "+++");
+        return SplitFrontMatter(content, TOML_LINE);
+    }
+
+    private static void WriteMarkdown(string file, string fm, string md)
+    {
+        var content = $"{TOML_LINE}\n{fm.Trim()}\n{TOML_LINE}\n{md.Trim()}\n";
+        File.WriteAllText(file, content);
     }
 
     private static (string?, string) SplitFrontMatter(string content, string split)
@@ -56,30 +68,51 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
     {
         var llm = await Tags.ConnectToModel();
 
-        var (fm, md) = ReadMarkdown(settings.FileName);
-        if (fm == null)
+        var (fmSource, md) = ReadMarkdown(settings.FileName);
+        if (fmSource == null)
         {
             AnsiConsole.WriteLine("Failed to read markdown");
             return -1;
         }
 
-        var parsed = TomlSerializer.Deserialize<FrontMatter>(fm);
-        if (parsed == null)
+        var fm = TomlSerializer.Deserialize<FrontMatter>(fmSource);
+        if (fm == null)
         {
             AnsiConsole.WriteLine("Failed to read frontmatter");
             return -1;
         }
 
-        var responses = await Tags.AiTags($"# {parsed.Title}\n\n {md}", "markdown", llm, "Format tags with spaces, normal capitalization and diacritics as you would in a normal sentence.");
-
-        var tags = responses.SelectMany(x => x.Tags).ToImmutableHashSet();
-
-        foreach (var r in tags)
+        fm.Tags = fm.Tags.Where(x => string.IsNullOrWhiteSpace(x) == false).Select(x => x.Trim()).ToList();
+        if(settings.Force == false)
         {
-            Console.WriteLine(r);
+            if (fm.Tags.Count != 0)
+            {
+                AnsiConsole.WriteLine("Post contains existing tags, ignoring");
+                foreach (var t in fm.Tags)
+                {
+                    AnsiConsole.WriteLine($" - [{t}]");
+                }
+                return -1;
+            }
         }
 
-        var ret = TomlSerializer.Serialize(parsed);
+        var responses = await Tags.AiTags($"# {fm.Title}\n\n {md}", "markdown", llm,
+            "Format tags with spaces, normal capitalization and diacritics as you would in a normal sentence. If it's a name, format it like wikipedia would, for example: 'New York (city)' and 'France (country)'. Don't use names inside parenthesis only nouns, for example not 'Stockholm (sweden)' but 'Stockholm (city)'.");
+
+        var newTags = responses.SelectMany(x => x.Tags).Select(x => x.Trim()).ToImmutableHashSet();
+        var oldTags = fm.Tags.Select(x => x.ToLowerInvariant()).ToImmutableHashSet();
+
+        foreach (var r in newTags)
+        {
+            Console.WriteLine(r);
+            if (oldTags.Contains(r.ToLowerInvariant()))
+            {
+                continue;
+            }
+            fm.Tags.Add(r);
+        }
+
+        WriteMarkdown(settings.FileName, TomlSerializer.Serialize(fm), md);
 
         return 0;
     }
