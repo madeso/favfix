@@ -6,8 +6,23 @@ using System.Collections.Immutable;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Xml.Serialization;
+using Tomlyn;
+using Tomlyn.Serialization;
 
 namespace favfix;
+
+public class FrontMatter
+{
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = "";
+
+    [JsonPropertyName("tags")]
+    public List<string> Tags { get; set; } = [];
+
+    [TomlExtensionData]
+    public IDictionary<string, object?>? Extra { get; set; }
+}
 
 internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
 {
@@ -32,7 +47,7 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         var second = content.IndexOf(split, first + split.Length, StringComparison.Ordinal);
         if (second == -1) return (null, content);
 
-        var header = content.Substring(first + split.Length, second);
+        var header = content.Substring(first + split.Length, second - (first + split.Length));
         var body = content.Substring(second + split.Length);
         return (header, body);
     }
@@ -47,7 +62,15 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
             AnsiConsole.WriteLine("Failed to read markdown");
             return -1;
         }
-        var responses = await Tags.AiTags(md, "markdown", llm, "Format tags with spaces, normal capitalization and diacritics as you would in a normal sentence.");
+
+        var parsed = TomlSerializer.Deserialize<FrontMatter>(fm);
+        if (parsed == null)
+        {
+            AnsiConsole.WriteLine("Failed to read frontmatter");
+            return -1;
+        }
+
+        var responses = await Tags.AiTags($"# {parsed.Title}\n\n {md}", "markdown", llm, "Format tags with spaces, normal capitalization and diacritics as you would in a normal sentence.");
 
         var tags = responses.SelectMany(x => x.Tags).ToImmutableHashSet();
 
@@ -55,6 +78,8 @@ internal class MarkdownCommand : AsyncCommand<MarkdownCommand.Settings>
         {
             Console.WriteLine(r);
         }
+
+        var ret = TomlSerializer.Serialize(parsed);
 
         return 0;
     }
